@@ -24,18 +24,6 @@ app.post("/paddle-webhook",
 
       console.log("Webhook event:", event.event_type);
 
-
-      // 🔹 Handle subscription.created
-      if (event.event_type === "subscription.created") {
-
-        const subscriptionId = event.data.id;
-        const customerId = event.data.customer_id;
-        const priceId = event.data.items?.[0]?.price_id;
-
-        console.log("Subscription created for customer:", customerId);
-
-        // We will link using email later via transaction event
-      }
       // Handle subscription.canceled
       if (event.event_type === "subscription.canceled") {
 
@@ -197,30 +185,28 @@ app.post("/paddle-webhook",
       // 🔹 Handle transaction.completed
       if (event.event_type === "transaction.completed") {
 
-        const transactionId = event.data.id;
         const subscriptionId = event.data.subscription_id;
         const customerId = event.data.customer_id;
-        const nextBilling =
-          event.data.billing_period?.ends_at || null;
 
         const priceId =
           event.data.items?.[0]?.price_id ||
           event.data.items?.[0]?.price?.id ||
           null;
 
-        console.log("Transaction completed:", transactionId);
-        console.log("Resolved priceId:", priceId);
+        const nextBilling =
+          event.data.billing_period?.ends_at || null;
 
-        const user = await User.findOne({
-          "subscription.paddleSubscriptionId": subscriptionId
-        });
+        // 🔥 READ USER ID DIRECTLY FROM PADDLE
+        const userId = event.data.custom_data?.userId;
 
-        if (!user) {
-          console.log("User not found for transaction:", transactionId);
-          return res.status(200).send("User not found");
+        console.log("Webhook userId:", userId);
+
+        if (!userId) {
+          console.log("No userId in custom_data");
+          return res.status(200).send("No userId");
         }
 
-        await User.findByIdAndUpdate(user._id, {
+        await User.findByIdAndUpdate(userId, {
           $set: {
             "subscription.status": "active",
             "subscription.plan": priceId,
@@ -230,8 +216,7 @@ app.post("/paddle-webhook",
           }
         });
 
-        console.log("User updated safely from webhook");
-
+        console.log("User updated safely via custom_data");
       }
       res.status(200).send("OK");
 
@@ -350,6 +335,9 @@ app.post("/create-checkout", async (req, res) => {
         ],
         customer: {
           email: req.user.email
+        },
+        custom_data: {
+          userId: req.user._id.toString()
         }
       },
       {
@@ -361,10 +349,13 @@ app.post("/create-checkout", async (req, res) => {
     );
 
     const transactionId = response.data.data.id;
+    const customerId = response.data.data.customer_id;
 
-    // 🔥 Save transactionId in user BEFORE payment
     await User.findByIdAndUpdate(req.user._id, {
-      "subscription.transactionId": transactionId
+      $set: {
+        "subscription.transactionId": transactionId,
+        "subscription.paddleCustomerId": customerId
+      }
     });
 
     res.json({ transactionId });
