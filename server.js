@@ -211,28 +211,26 @@ app.post("/paddle-webhook",
 
         const userId = event.data.custom_data?.userId;
 
-        // 🔥 If first payment (checkout)
+        // 🔥 First subscription creation (DON'T FORCE ACTIVE)
         if (userId) {
+
           await User.findByIdAndUpdate(userId, {
             $set: {
-              "subscription.status": "active",
               "subscription.plan": priceId,
-              "subscription.paddleSubscriptionId": subscriptionId,
               "subscription.paddleCustomerId": customerId,
               "subscription.nextBillingDate": nextBilling
             }
           });
 
-          console.log("Initial subscription created");
+          console.log("Initial subscription created (status handled by subscription event)");
         }
         else {
-          // 🔥 If upgrade / renewal
+          // 🔥 Renewal or upgrade
           await User.findOneAndUpdate(
             { "subscription.paddleSubscriptionId": subscriptionId },
             {
               $set: {
                 "subscription.plan": priceId,
-                "subscription.status": "active",
                 "subscription.nextBillingDate": nextBilling
               }
             }
@@ -243,14 +241,57 @@ app.post("/paddle-webhook",
       }
       //  Handle subscription.activated
       if (event.event_type === "subscription.activated") {
+
         const subscriptionId = event.data.id;
+        const nextBilling =
+          event.data.current_billing_period?.ends_at;
 
         await User.findOneAndUpdate(
           { "subscription.paddleSubscriptionId": subscriptionId },
-          { $set: { "subscription.status": "active" } }
+          {
+            $set: {
+              "subscription.status": "active",
+              "subscription.nextBillingDate": nextBilling
+            },
+            $unset: {
+              "subscription.trialEndsAt": ""
+            }
+          }
         );
 
-        console.log("Subscription activated");
+        console.log("Trial converted to paid subscription");
+      }
+      // 🔵 Handle subscription.created
+      if (event.event_type === "subscription.created") {
+
+        const subscriptionId = event.data.id;
+        const status = event.data.status;
+
+        const priceId =
+          event.data.items?.[0]?.price?.id || null;
+
+        const trialEnd =
+          event.data.current_billing_period?.ends_at;
+
+        const userId = event.data.custom_data?.userId;
+
+        if (!userId) {
+          console.log("No userId in subscription.created");
+          return;
+        }
+
+        await User.findByIdAndUpdate(userId, {
+          $set: {
+            "subscription.paddleSubscriptionId": subscriptionId,
+            "subscription.plan": priceId,
+            "subscription.status": status,
+            "subscription.trialEndsAt":
+              status === "trialing" ? trialEnd : null,
+            "subscription.nextBillingDate": trialEnd
+          }
+        });
+
+        console.log("Subscription created & stored correctly");
       }
       // Handle subscription.past_due
       if (event.event_type === "subscription.past_due") {
@@ -273,6 +314,30 @@ app.post("/paddle-webhook",
         );
 
         console.log("Transaction past_due");
+      }
+      // 🔵 Handle subscription.trialing
+      if (event.event_type === "subscription.trialing") {
+
+        const subscriptionId = event.data.id;
+        const trialEnd =
+          event.data.current_billing_period?.ends_at;
+
+        const userId = event.data.custom_data?.userId;
+
+        if (!userId) {
+          console.log("No userId in subscription.trialing");
+          return;
+        }
+
+        await User.findByIdAndUpdate(userId, {
+          $set: {
+            "subscription.status": "trialing",
+            "subscription.trialEndsAt": trialEnd,
+            "subscription.nextBillingDate": trialEnd
+          }
+        });
+
+        console.log("Trial started & saved correctly");
       }
       // Handle transaction.updated
       if (event.event_type === "transaction.updated") {
@@ -382,7 +447,7 @@ app.post("/create-checkout", async (req, res) => {
       return res.status(401).json({ error: "User not authenticated" });
     }
 
-    const { priceId } = req.body;
+    const { priceId, discountCode } = req.body;
 
     const response = await axios.post(
       "https://sandbox-api.paddle.com/transactions",
@@ -398,7 +463,10 @@ app.post("/create-checkout", async (req, res) => {
         },
         custom_data: {
           userId: req.user._id.toString()
-        }
+        },
+        ...(discountCode && {
+          discount_code: discountCode
+        }),
       },
       {
         headers: {
@@ -617,13 +685,67 @@ app.post("/preview-upgrade", async (req, res) => {
 
     res.json({
       currency: data.currency_code,
-      fullPrice: Number(data.details.totals.grand_total),
+      amountDueNow: Number(data.details.totals.grand_total) / 100,
+      fullPlanPrice:
+        Number(data.items[0].price.unit_price.amount) / 100,
       description: data.items[0].price.description
     });
 
   } catch (error) {
     console.log("🔥 PREVIEW ERROR:", error.response?.data || error.message);
     res.status(500).json({ error: "Preview failed" });
+  }
+});
+
+// 🔎 Validate Discount Code
+app.post("/validate-coupon", async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Not authenticated" });
+    }
+
+    const { priceId, discountCode } = req.body;
+
+    if (!discountCode || discountCode.trim() === "") {
+      return res.status(400).json({ error: "No coupon provided" });
+    }
+
+    const response = await axios.post(
+      "https://sandbox-api.paddle.com/transactions/preview",
+      {
+        items: [
+          {
+            price_id: priceId,
+            quantity: 1
+          }
+        ],
+        discount_code: discountCode.trim()
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.PADDLE_API_KEY}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    const data = response.data.data;
+
+    res.json({
+      valid: true,
+      newTotal: data.details.totals.grand_total / 100,
+      currency: data.currency_code
+    });
+
+  } catch (error) {
+    console.log("Coupon validation error:",
+      JSON.stringify(error.response?.data, null, 2)
+    );
+
+    res.status(400).json({
+      valid: false,
+      message: "Invalid or expired coupon"
+    });
   }
 });
 

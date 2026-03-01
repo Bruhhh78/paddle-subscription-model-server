@@ -15,6 +15,7 @@ const userSchema = new mongoose.Schema({
     transactionId: { type: String, default: null },
 
     nextBillingDate: { type: Date, default: null },
+    trialEndsAt: Date,
 
     cancelAt: { type: Date, default: null },
     pauseAt: { type: Date, default: null },
