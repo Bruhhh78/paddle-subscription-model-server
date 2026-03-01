@@ -66,7 +66,23 @@ app.post("/paddle-webhook",
         console.log("Subscription updated status:", status);
         console.log("Scheduled change:", scheduledChange);
 
-        // If cancellation is scheduled
+        // 🔥 1️⃣ UPDATE PLAN FIRST (for upgrade)
+        const newPriceId = event.data.items?.[0]?.price?.id;
+
+        if (newPriceId) {
+          await User.findOneAndUpdate(
+            { "subscription.paddleSubscriptionId": subscriptionId },
+            {
+              $set: {
+                "subscription.plan": newPriceId
+              }
+            }
+          );
+
+          console.log("Plan updated via subscription.updated:", newPriceId);
+        }
+
+        // 🔴 2️⃣ Handle cancellation scheduled
         if (scheduledChange && scheduledChange.action === "cancel") {
           await User.findOneAndUpdate(
             { "subscription.paddleSubscriptionId": subscriptionId },
@@ -80,9 +96,8 @@ app.post("/paddle-webhook",
           console.log("Subscription marked as canceling");
         }
 
-        // 🔵 If pause is scheduled
+        // 🔵 3️⃣ Handle pause scheduled
         if (scheduledChange && scheduledChange.action === "pause") {
-
           await User.findOneAndUpdate(
             { "subscription.paddleSubscriptionId": subscriptionId },
             {
@@ -96,9 +111,8 @@ app.post("/paddle-webhook",
           console.log("Subscription marked as pausing");
         }
 
-        // 🔵 Fully paused (after effective date)
+        // 🔵 4️⃣ Fully paused
         if (status === "paused") {
-
           await User.findOneAndUpdate(
             { "subscription.paddleSubscriptionId": subscriptionId },
             {
@@ -111,9 +125,9 @@ app.post("/paddle-webhook",
 
           console.log("Subscription fully paused");
         }
-        // If fully canceled (after period ends)
-        if (status === "canceled") {
 
+        // 🔴 5️⃣ Fully canceled
+        if (status === "canceled") {
           await User.findOneAndUpdate(
             { "subscription.paddleSubscriptionId": subscriptionId },
             {
@@ -126,9 +140,8 @@ app.post("/paddle-webhook",
           console.log("Subscription fully canceled");
         }
 
-        // 🟢 Fully active (resumed or normal)
+        // 🟢 6️⃣ Fully active
         if (status === "active" && !scheduledChange) {
-
           await User.findOneAndUpdate(
             { "subscription.paddleSubscriptionId": subscriptionId },
             {
@@ -143,7 +156,7 @@ app.post("/paddle-webhook",
             }
           );
 
-          console.log("Subscription active (Resumed)");
+          console.log("Subscription active (Resumed or upgraded)");
         }
       }
       // Handle subscription.paused
@@ -196,27 +209,74 @@ app.post("/paddle-webhook",
         const nextBilling =
           event.data.billing_period?.ends_at || null;
 
-        // 🔥 READ USER ID DIRECTLY FROM PADDLE
         const userId = event.data.custom_data?.userId;
 
-        console.log("Webhook userId:", userId);
+        // 🔥 If first payment (checkout)
+        if (userId) {
+          await User.findByIdAndUpdate(userId, {
+            $set: {
+              "subscription.status": "active",
+              "subscription.plan": priceId,
+              "subscription.paddleSubscriptionId": subscriptionId,
+              "subscription.paddleCustomerId": customerId,
+              "subscription.nextBillingDate": nextBilling
+            }
+          });
 
-        if (!userId) {
-          console.log("No userId in custom_data");
-          return res.status(200).send("No userId");
+          console.log("Initial subscription created");
         }
+        else {
+          // 🔥 If upgrade / renewal
+          await User.findOneAndUpdate(
+            { "subscription.paddleSubscriptionId": subscriptionId },
+            {
+              $set: {
+                "subscription.plan": priceId,
+                "subscription.status": "active",
+                "subscription.nextBillingDate": nextBilling
+              }
+            }
+          );
 
-        await User.findByIdAndUpdate(userId, {
-          $set: {
-            "subscription.status": "active",
-            "subscription.plan": priceId,
-            "subscription.paddleSubscriptionId": subscriptionId,
-            "subscription.paddleCustomerId": customerId,
-            "subscription.nextBillingDate": nextBilling
-          }
-        });
+          console.log("Upgrade or renewal processed");
+        }
+      }
+      //  Handle subscription.activated
+      if (event.event_type === "subscription.activated") {
+        const subscriptionId = event.data.id;
 
-        console.log("User updated safely via custom_data");
+        await User.findOneAndUpdate(
+          { "subscription.paddleSubscriptionId": subscriptionId },
+          { $set: { "subscription.status": "active" } }
+        );
+
+        console.log("Subscription activated");
+      }
+      // Handle subscription.past_due
+      if (event.event_type === "subscription.past_due") {
+        const subscriptionId = event.data.id;
+
+        await User.findOneAndUpdate(
+          { "subscription.paddleSubscriptionId": subscriptionId },
+          { $set: { "subscription.status": "past_due" } }
+        );
+
+        console.log("Subscription past_due");
+      }
+      // Handle transaction.past_due
+      if (event.event_type === "transaction.past_due") {
+        const subscriptionId = event.data.subscription_id;
+
+        await User.findOneAndUpdate(
+          { "subscription.paddleSubscriptionId": subscriptionId },
+          { $set: { "subscription.status": "past_due" } }
+        );
+
+        console.log("Transaction past_due");
+      }
+      // Handle transaction.updated
+      if (event.event_type === "transaction.updated") {
+        console.log("Transaction updated:", event.data.id);
       }
       res.status(200).send("OK");
 
@@ -465,6 +525,105 @@ app.post("/resume-subscription", async (req, res) => {
   } catch (error) {
     console.log("Resume error:", error.response?.data || error.message);
     res.status(500).json({ error: "Resume failed" });
+  }
+});
+
+//  Upgrade Subscription (Modal Way)
+app.post("/upgrade-subscription", async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Not authenticated" });
+    }
+
+    const { newPriceId } = req.body;
+
+    const subscriptionId = req.user.subscription?.paddleSubscriptionId;
+
+    if (!subscriptionId) {
+      return res.status(400).json({ error: "No active subscription" });
+    }
+
+    console.log("🔄 Upgrading subscription:", subscriptionId);
+    console.log("➡️ New price:", newPriceId);
+
+    const response = await axios.patch(
+      `https://sandbox-api.paddle.com/subscriptions/${subscriptionId}`,
+      {
+        items: [
+          {
+            price_id: newPriceId,
+            quantity: 1
+          }
+        ],
+        proration_billing_mode: "prorated_immediately"
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.PADDLE_API_KEY}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    console.log("✅ Upgrade success:", response.data.data.id);
+
+    res.json({ message: "Upgrade successful" });
+
+  } catch (error) {
+    console.log("🔥 UPGRADE ERROR STATUS:", error.response?.status);
+    console.log("🔥 UPGRADE ERROR DATA:", error.response?.data);
+    console.log("🔥 UPGRADE ERROR MESSAGE:", error.message);
+
+    res.status(500).json({ error: "Upgrade failed" });
+  }
+});
+
+// 🔍 Preview Upgrade
+app.post("/preview-upgrade", async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Not authenticated" });
+    }
+
+    const { newPriceId } = req.body;
+
+    const subscriptionId = req.user.subscription?.paddleSubscriptionId;
+
+    if (!subscriptionId) {
+      return res.status(400).json({ error: "No active subscription" });
+    }
+
+    const response = await axios.post(
+      "https://sandbox-api.paddle.com/transactions/preview",
+      {
+        subscription_id: subscriptionId,
+        items: [
+          {
+            price_id: newPriceId,
+            quantity: 1
+          }
+        ],
+        proration_billing_mode: "prorated_immediately"
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.PADDLE_API_KEY}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    const data = response.data.data;
+
+    res.json({
+      currency: data.currency_code,
+      fullPrice: Number(data.details.totals.grand_total),
+      description: data.items[0].price.description
+    });
+
+  } catch (error) {
+    console.log("🔥 PREVIEW ERROR:", error.response?.data || error.message);
+    res.status(500).json({ error: "Preview failed" });
   }
 });
 
