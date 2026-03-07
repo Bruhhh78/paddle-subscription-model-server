@@ -6,6 +6,7 @@ const cors = require("cors");
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const session = require("express-session");
+const crypto = require("crypto");
 const User = require("./models/User");
 
 const app = express();
@@ -15,12 +16,58 @@ app.use(cors({
   credentials: true
 }));
 
-app.post("/paddle-webhook",
+app.post(
+  "/paddle-webhook",
   express.raw({ type: "application/json" }),
   async (req, res) => {
     try {
+      // console.log("Signature header:", req.headers["paddle-signature"]);
 
-      const event = JSON.parse(req.body.toString());
+      const signatureHeader = req.headers["paddle-signature"];
+      const rawBody = req.body; 
+
+      if (!signatureHeader) {
+        console.log("Missing signature header");
+        return res.status(400).send("Missing signature");
+      }
+
+      // extract timestamp and signature
+      const parts = signatureHeader.split(";");
+      let timestamp;
+      let signature;
+
+      for (const part of parts) {
+        const [key, value] = part.split("=");
+        if (key === "ts") timestamp = value;
+        if (key === "h1") signature = value;
+      }
+
+      if (!timestamp || !signature) {
+        console.log("Invalid signature format");
+        return res.status(400).send("Invalid signature format");
+      }
+
+      // create signed payload
+      const signedPayload = Buffer.concat([
+        Buffer.from(timestamp + ":"),
+        rawBody
+      ]);
+
+      // generate expected signature
+      const expectedSignature = crypto
+        .createHmac("sha256", process.env.PADDLE_WEBHOOK_SECRET)
+        .update(signedPayload)
+        .digest("hex");
+
+      // compare signatures
+      if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSignature))) {
+        console.log("Invalid webhook signature");
+        return res.status(401).send("Invalid signature");
+      }
+
+      console.log("✅ Webhook signature VERIFIED");
+
+      const event = JSON.parse(rawBody.toString());
 
       console.log("Webhook event:", event.event_type);
 
